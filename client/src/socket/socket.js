@@ -7,7 +7,7 @@
 import { io } from "socket.io-client";
 
 const SOCKET_URL =
- "http://192.168.56.1:4000";
+ "http://172.16.16.150:4000";
 
 const socket = io(SOCKET_URL, {
   autoConnect: false,   // we connect manually after username is set
