@@ -72,18 +72,25 @@ function handleSocketEvents(io, socket, messageStore) {
     let result = null;
     try{
       result = await processMessage(message);
-      console.log("ML Result:", result);
+      console.log("ML moderation result:", result);
+    }catch(err){
+      console.error("ML moderation error:", err);
+    }
 
-      if (result && result.type === "spam"){
+    if (result && (result.spam === 1 || result.spam === true || result.type === "spam")){
       io.emit("receive_message",{
         type:"system",
-        text:`Spam detected from ${username}`,
+        text:"Message blocked by ML moderation",
+
       });
       return;
     }
-    }
-    catch(err){
-      console.error("ML failed: ",err.message);
+    if (result && (result.toxic === 1 || result.toxic === true || result.type === "toxic")){
+      io.emit("receive_message",{
+        type:"system",
+        text:"Message blocked due to toxic content",
+      });
+      return;
     }
     // ────────────────────────────────────────────────────────────────────────
 
