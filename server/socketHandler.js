@@ -7,7 +7,11 @@
 
 const { formatMessage } = require("./messageFormatter");
 const { processMessage } = require("./mlBridge");
-let recentMessages = [];
+const SituationManager = require("./SituationManager");
+const { computeRisk, decideAction } = require('./riskEngine');
+const situationManager = new SituationManager();
+const ClusterManager = require('./ClusterManager');
+const clusterManager = new ClusterManager();
 
 // Track connected users: socketId → username
 const connectedUsers = new Map();
@@ -38,6 +42,10 @@ function handleSocketEvents(io, socket, messageStore) {
     messageStore.add(joinMessage);
     io.emit("receive_message", joinMessage);
   });
+  socket.on("join_dashboard", () => {
+  console.log("🛡 Moderator dashboard connected");
+  socket.join("moderators");
+});
 
   // ── send_message ───────────────────────────────────────────────────────────
   socket.on("send_message", async ({ text }) => {
@@ -47,57 +55,76 @@ function handleSocketEvents(io, socket, messageStore) {
     // Guard: reject empty or whitespace-only messages
     if (!text || typeof text !== "string" || text.trim() === "") return;
 
-    
+    const cleanText = text.trim().slice(0,500);
     const message = formatMessage({
       type: "user",
-      text: text.trim().slice(0, 500), // cap message length
+      text: cleanText, // cap message length
       username,
       socketId: socket.id,
     });
-    recentMessages.push(message);
     
-    if (recentMessages.length > 10){
-      recentMessages.shift();
-    }
-    const similarMessages = recentMessages.filter(
-      (m) => m.text === message.text
-    );
-    if(similarMessages.length >= 3){
-      io.emit("receive_message",{
-        type:"system",
-        text:"Possible spam campaign detected"
-      });
-    }
-    // ── ML moderation hook ──────────────────────────────────────────────────
-    let result = null;
+    const situation = situationManager.update(socket.id, cleanText);
+
+    let mlResult = {};
     try{
-      result = await processMessage(message);
-      console.log("ML moderation result:", result);
+      mlResult = await processMessage({
+        user:username,
+        message:cleanText,
+        timestamp: new Date().toISOString()
+      });
     }catch(err){
-      console.error("ML moderation error:", err);
+      console.error("ML Error: ", err);
     }
+    const finalRisk = computeRisk(mlResult,situation);
+    const action = decideAction(finalRisk);
+    const cluster = clusterManager.addMessage({
+      user:username,
+      message:cleanText,
+      risk:finalRisk,
+      mlResult,
+    })
+    io.to("moderators").emit("moderation_event", {
+  clusterId: cluster.id,
+  type: cluster.type,
+  users: Array.from(cluster.users),
+  messages: cluster.messages,
+  count: cluster.count,
+  risk: cluster.risk,
+  action,
+  timestamp: new Date().toISOString(),
+});
+console.log("📡 CLUSTER EMIT:", {
+  clusterId: cluster.id,
+  count: cluster.count,
+});
 
-    if (result && (result.spam === 1 || result.spam === true || result.type === "spam")){
-      io.emit("receive_message",{
-        type:"system",
-        text:"Message blocked by ML moderation",
+    console.log("Situation is now", situation);
+    console.log("ML decided", mlResult);
+    console.log("Final Risk given : ", finalRisk,"| Action:",action);
 
-      });
-      return;
+    console.log({
+    situation,
+    mlResult,
+    finalRisk,
+    action
+    });
+
+    if (action === "BLOCK"){
+      socket.emit("receive_message", {
+      type: "system",
+      text: "🚫 Message blocked (high risk)",
+    });
+    return;
     }
-    if (result && (result.toxic === 1 || result.toxic === true || result.type === "toxic")){
-      io.emit("receive_message",{
-        type:"system",
-        text:"Message blocked due to toxic content",
-      });
-      return;
-    }
-    // ────────────────────────────────────────────────────────────────────────
-
-    messageStore.add(message);
-    io.emit("receive_message", message); // broadcast to ALL clients
-    console.log(`💬 [${username}]: ${message.text}`);
-  });
+    if (action === "WARN") {
+      socket.emit("receive_message", {
+      type: "system",
+      text: "⚠️ Warning: your message may violate guidelines",
+    });
+  }
+  messageStore.add({ ...message, risk: finalRisk });
+  io.emit("receive_message", { ...message, risk: finalRisk });
+});
 
   // ── typing indicator ───────────────────────────────────────────────────────
   socket.on("typing_start", () => {

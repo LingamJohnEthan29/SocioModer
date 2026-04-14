@@ -3,9 +3,9 @@ const axios = require("axios");
 async function processMessage(message) {
   try {
     const payload = {
-      user: message.username || "unknown",
-      message: message.text || "",
-      timestamp: message.timestamp || new Date().toISOString(), // 🔥 FIX
+      user: message.user || message.username || "unknown",
+      message: message.message || message.text || "",
+      timestamp: message.timestamp || new Date().toISOString(),
     };
 
     console.log("SENDING TO ML:", payload); // 🧪 debug
