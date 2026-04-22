@@ -7,9 +7,12 @@
 import { io } from "socket.io-client";
 
 const SOCKET_URL =
- "http://172.17.21.191:4000";
+ "http://localhost:4000";
 
 const socket = io(SOCKET_URL, {
+  auth:{
+    token:localStorage.getItem("token")
+,  },
   autoConnect: false,   // we connect manually after username is set
   reconnection: true,
   reconnectionAttempts: 5,

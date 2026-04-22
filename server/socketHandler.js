@@ -9,32 +9,51 @@ const userProfiles = new Map(); // userId → profile
 // Track connected users
 const connectedUsers = new Map();
 const userRoomActivity = new Map();
+const Message = require('./models/Message');
+const UserProfile = require('./models/UserProfile');
+const userSockets = new Map();
+const User = require('./models/User');
+
 
 function handleSocketEvents(io, socket, messageStore) {
-  console.log(`🔌 New connection: ${socket.id}`);
+  console.log(`🔌 New connection: ${socket.user.userId}`);
+
+  if (!userSockets.has(socket.user.userId)){
+    userSockets.set(socket.user.userId, new Set());
+  }
+
+  userSockets.get(socket.user.userId).add(socket);
 
   // ── JOIN ROOM ─────────────────────────────────────────
-  socket.on("join_room", ({ username, roomId }) => {
+  socket.on("join_room", async ({ username, roomId }) => {
+    const existingProfile = await UserProfile.findOne({userId: socket.user.userId });
+    if (existingProfile){
+      userProfiles.set(socket.user.userId,{
+        ...existingProfile.toObject(),
+      })
+    }
     if (!username || !roomId) return;
 
-    const sanitizedUsername = username.trim().slice(0, 30);
+    const sanitizedUsername = socket.user.username;
 
     socket.join(roomId);
 
-    connectedUsers.set(socket.id, {
-      userId: socket.id,
-      username: sanitizedUsername,
-      roomId,
-    });
+    connectedUsers.set(socket.user.userId, {
+  userId: socket.user.userId,
+  username: socket.user.username,
+  roomId,
+});
 
     console.log(`👤 ${sanitizedUsername} joined room ${roomId}`);
 
     // Send only this room's history
-    const roomMessages = messageStore
-      .getAll()
-      .filter((m) => m.roomId === roomId);
+    const message = await Message.find({ roomId })
+    .sort({createdAt:-1})
+    .limit(50)
+    .lean();
+    message.reverse();
 
-    socket.emit("message_history", roomMessages);
+    socket.emit("message_history", message);
 
     // Send user list for this room
     io.to(roomId).emit("user_list", getUsersInRoom(roomId));
@@ -57,21 +76,21 @@ function handleSocketEvents(io, socket, messageStore) {
 
   // ── SEND MESSAGE ──────────────────────────────────────
   socket.on("send_message", async ({ text }) => {
-    const user = connectedUsers.get(socket.id);
+    const user = connectedUsers.get(socket.user.userId);
     if (!user) return;
 
     const { username, roomId } = user;
 
-    if (!userRoomActivity.has(socket.id)) {
-  userRoomActivity.set(socket.id, new Set());
+    if (!userRoomActivity.has(socket.user.userId)) {
+  userRoomActivity.set(socket.user.userId, new Set());
 }
 
-userRoomActivity.get(socket.id).add(roomId);
+userRoomActivity.get(socket.user.userId).add(roomId);
 
 
-    if (!userProfiles.has(socket.id)) {
-  userProfiles.set(socket.id, {
-    userId: socket.id,
+    if (!userProfiles.has(socket.user.userId)) {
+  userProfiles.set(socket.user.userId, {
+    userId: socket.user.userId,
     username,
     messageCount: 0,
     toxicCount: 0,
@@ -81,7 +100,7 @@ userRoomActivity.get(socket.id).add(roomId);
   });
 }
 
-const profile = userProfiles.get(socket.id);
+const profile = userProfiles.get(socket.user.userId);
 
     if (!text || typeof text !== "string" || text.trim() === "") return;
 
@@ -91,7 +110,7 @@ const profile = userProfiles.get(socket.id);
       type: "user",
       text: cleanText,
       username,
-      socketId: socket.id,
+      socketId: socket.user.userId,
     });
 
     if (!roomSituations.has(roomId)){
@@ -104,7 +123,7 @@ const profile = userProfiles.get(socket.id);
     const situationManager = roomSituations.get(roomId);
     const clusterManager = roomClusters.get(roomId);
 
-    const situation = situationManager.update(socket.id, cleanText);
+    const situation = situationManager.update(socket.user.userId, cleanText);
 
 
     let mlResult = {};
@@ -122,7 +141,12 @@ const profile = userProfiles.get(socket.id);
 profile.toxicCount += mlResult.toxic || 0;
 profile.spamCount += mlResult.spam || 0;
 
+if (!profile.lastMessages) {
+  profile.lastMessages = [];
+}
+
 profile.lastMessages.push(cleanText);
+
 if (profile.lastMessages.length > 5) {
   profile.lastMessages.shift();
 }
@@ -135,7 +159,31 @@ profile.riskScore =
   0.2 * (situation.repetitionScore || 0);
   let userFlag = "NORMAL";
 
-const roomsUsed = userRoomActivity.get(socket.id);
+let dbProfile = await UserProfile.findOne({userId:socket.user.userId});
+if(!dbProfile){
+  dbProfile = await UserProfile.create({
+    userId:socket.user.userId,
+    username,
+  });
+}
+
+dbProfile.messageCount += 1;
+dbProfile.spamCount += mlResult.spam || 0;
+dbProfile.toxicCount += mlResult.toxic || 0;
+
+dbProfile.riskScore = profile.riskScore;
+if (!dbProfile.roomsUsed) {
+  dbProfile.roomsUsed = [];
+}
+
+if (!dbProfile.roomsUsed.includes(roomId)) {
+  dbProfile.roomsUsed.push(roomId);
+}
+dbProfile.updatedAt = new Date();
+
+await dbProfile.save();
+
+const roomsUsed = userRoomActivity.get(socket.user.userId) || new Set();
 const roomCount = roomsUsed.size;
 
 let crossRoomFlag = null;
@@ -209,7 +257,12 @@ if (profile.riskScore > 0.7) {
     }
 
     // Save message WITH roomId
-    messageStore.add({ ...message, risk: finalRisk, roomId });
+    await Message.create({
+      username,
+      text:cleanText,
+      roomId,
+      risk: finalRisk,
+    })
 
     // Send ONLY to that room
     io.to(roomId).emit("receive_message", {
@@ -220,7 +273,7 @@ if (profile.riskScore > 0.7) {
 
   // ── TYPING START ──────────────────────────────────────
   socket.on("typing_start", () => {
-    const user = connectedUsers.get(socket.id);
+    const user = connectedUsers.get(socket.user.userId);
     if (!user) return;
 
     const { username, roomId } = user;
@@ -230,7 +283,7 @@ if (profile.riskScore > 0.7) {
 
   // ── TYPING STOP ───────────────────────────────────────
   socket.on("typing_stop", () => {
-    const user = connectedUsers.get(socket.id);
+    const user = connectedUsers.get(socket.user.userId);
     if (!user) return;
 
     const { username, roomId } = user;
@@ -240,12 +293,19 @@ if (profile.riskScore > 0.7) {
 
   // ── DISCONNECT ────────────────────────────────────────
   socket.on("disconnect", () => {
-    const user = connectedUsers.get(socket.id);
+    const sockets = userSockets.get(socket.user.userId);
+    if (sockets){
+      sockets.delete(socket);
+      if (socket.size === 0){
+        userSockets.delete(socket.user.userId);
+      }
+    }
+    const user = connectedUsers.get(socket.user.userId);
     if (!user) return;
 
     const { username, roomId } = user;
 
-    connectedUsers.delete(socket.id);
+    connectedUsers.delete(socket.user.userId);
 
     console.log(`👋 ${username} disconnected`);
 
@@ -260,6 +320,36 @@ if (profile.riskScore > 0.7) {
 
     io.to(roomId).emit("receive_message", leaveMessage);
   });
+  socket.on("ban_user", async ({ username }) => {
+  try {
+    const user = await User.findOne({ username });
+
+    if (!user) return;
+
+    user.isBanned = true;
+    user.bannedAt = new Date();
+    await user.save();
+
+    console.log(`🚫 Banned user: ${username}`);
+
+    // 🔥 Disconnect all active sockets
+    const sockets = userSockets.get(user._id.toString());
+
+    if (sockets) {
+      sockets.forEach((s) => {
+        s.emit("banned", {
+          message: "You have been banned",
+        });
+        s.disconnect();
+      });
+
+      userSockets.delete(user._id.toString());
+    }
+
+  } catch (err) {
+    console.error("Ban error:", err);
+  }
+});
 }
 
 // ── HELPERS ─────────────────────────────────────────────
